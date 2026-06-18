@@ -1,0 +1,10 @@
+langgraph
+langchain
+langchain-openai
+fastapi
+uvicorn
+langfuse
+python-dotenv
+yfinance
+newsapi-python
+pandas
