@@ -1,0 +1,53 @@
+pipeline {
+agent any
+
+
+stages {
+    stage('Preparation') {
+        steps {
+            git branch: 'main',
+                credentialsId: 'git-token',
+                url: 'https://github.com/aegletek/financial-research-assistant-.git'
+        }
+    }
+    
+    stage('Create Env File') {
+        steps {
+            withCredentials([
+                string(credentialsId: 'openrouter-key', variable: 'OPENROUTER_API_KEY')
+            ]) {
+                sh '''
+                    echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" > .env
+                '''
+            }
+        }
+    }
+
+    stage('Build Docker Image') {
+        steps {
+            sh 'docker compose up -d'
+        }
+    }
+
+    stage('Docker Images') {
+        steps {
+            sh 'docker images'
+        }
+    }
+
+    stage('Tag Image') {
+        steps {
+            sh 'docker tag financial-research-assistant--financial-assit:latest akshithavarkala/financial-assistant:latest'
+        }
+    }
+
+    stage('Push Image') {
+        steps {
+            sh 'docker push akshithavarkala/financial-assistant:latest'
+            }
+        }
+    }
+
+}
+
+
