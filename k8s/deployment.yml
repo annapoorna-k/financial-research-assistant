@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: financial-assis-deploy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: financial-assistant
+  template:
+    metadata:
+      labels:
+        app: financial-assistant
+    spec:
+      containers:
+      - name: financial-assistant
+        image: akshithavarkala/financial-assistant:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: OPENROUTER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: financial-secret
+              key: openrouter-api-key
