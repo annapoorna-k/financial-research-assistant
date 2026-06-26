@@ -1,25 +1,53 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: financial-assis-deploy
+  name: finan-deploy
+
 spec:
-  replicas: 2
+  replicas: 1
+
   selector:
     matchLabels:
-      app: financial-assistant
+      app: finan
+
   template:
     metadata:
       labels:
-        app: financial-assistant
+        app: finan
+
     spec:
       containers:
-      - name: financial-assistant
-        image: akshithavarkala/financial-assistant:latest
-        ports:
-        - containerPort: 8000
-        env:
-        - name: OPENROUTER_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: financial-secret
-              key: openrouter-api-key
+        - name: my-finan
+          image: yashuraj/myfinan
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8000
+
+          env:
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: financial-secret
+                  key: openrouter-api-key
+
+            - name: NEWS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: financial-secret
+                  key: news-api-key
+
+            - name: LANGFUSE_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: financial-secret
+                  key: langfuse-public-key
+
+            - name: LANGFUSE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: financial-secret
+                  key: langfuse-secret-key
+
+            - name: LANGFUSE_BASE_URL
+              value: "https://cloud.langfuse.com"

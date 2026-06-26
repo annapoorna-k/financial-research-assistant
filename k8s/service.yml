@@ -1,12 +1,15 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: financial-assistant-service
+  name: finan-svc
+
 spec:
   selector:
-    app: financial-assistant
+    app: finan
+
   ports:
     - protocol: TCP
       port: 80
       targetPort: 8000
+
   type: NodePort
