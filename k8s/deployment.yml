@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: finan-deploy
+  namespace: financial
 
 spec:
   replicas: 1
@@ -14,11 +15,15 @@ spec:
     metadata:
       labels:
         app: finan
+      annotations:
+        azure.workload.identity/use: "true"
 
     spec:
+      serviceAccountName: financial-sa
+
       containers:
         - name: my-finan
-          image: yashuraj/myfinan
+          image: financialacr.azurecr.io/financial-re:latest
           imagePullPolicy: Always
 
           ports:
@@ -50,4 +55,20 @@ spec:
                   key: langfuse-secret-key
 
             - name: LANGFUSE_BASE_URL
-              value: "https://cloud.langfuse.com"
+              valueFrom:
+                secretKeyRef:
+                  name: financial-secret
+                  key: langfuse-base-url
+
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: financial-keyvault

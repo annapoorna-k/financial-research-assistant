@@ -1,0 +1,721 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  pythonVersion: '3.12'
+
+  # Azure
+  azureServiceConnection: 'financial-service-connection'
+  resourceGroup: 'rg-financial'
+  aksCluster: 'aks-financial'
+  namespace: 'financial'
+
+  # ACR
+  acrName: 'financialacr'
+  acrLoginServer: 'financialacr.azurecr.io'
+  imageName: 'financial-re'
+  imageTag: '$(Build.BuildId)'
+
+stages:
+
+# ============================================================
+# STAGE 1 - DEVSECOPS SECURITY
+# ============================================================
+
+- stage: Security
+  displayName: 'DevSecOps Security Scans'
+
+  jobs:
+
+  # ----------------------------------------------------------
+  # SAST - BANDIT
+  # ----------------------------------------------------------
+
+  - job: SAST
+    displayName: 'SAST - Python Security Scan'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install bandit
+      displayName: 'Install Bandit'
+
+    - script: |
+        bandit -r . \
+          -x ./venv,./.venv,./tests \
+          -f txt \
+          -o bandit-report.txt || true
+
+        echo "===== Bandit Report ====="
+        cat bandit-report.txt
+      displayName: 'Run SAST - Bandit'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish SAST Report'
+      inputs:
+        pathToPublish: 'bandit-report.txt'
+        artifactName: 'SAST-Report'
+
+
+  # ----------------------------------------------------------
+  # DEPENDENCY SCANNING - PIP AUDIT
+  # ----------------------------------------------------------
+
+  - job: DependencyScan
+    displayName: 'Dependency Vulnerability Scan'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install pip-audit
+      displayName: 'Install pip-audit'
+
+    - script: |
+        pip-audit \
+          -r requirements.txt \
+          -f json \
+          -o pip-audit-report.json || true
+
+        echo "Dependency scan completed."
+      displayName: 'Run Dependency Scan'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Dependency Report'
+      inputs:
+        pathToPublish: 'pip-audit-report.json'
+        artifactName: 'Dependency-Scan'
+
+
+  # ----------------------------------------------------------
+  # SECRET SCANNING - DETECT SECRETS
+  # ----------------------------------------------------------
+
+  - job: SecretScan
+    displayName: 'Secret Detection'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install detect-secrets
+      displayName: 'Install detect-secrets'
+
+    - script: |
+        detect-secrets scan \
+          --exclude-files '(^|/)\.git/.*' \
+          --exclude-files '(^|/)venv/.*' \
+          --exclude-files '(^|/)\.venv/.*' \
+          > detect-secrets-report.json
+
+        echo "Secret scan completed."
+      displayName: 'Run Secret Scan'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Secret Scan Report'
+      inputs:
+        pathToPublish: 'detect-secrets-report.json'
+        artifactName: 'Secret-Scan'
+
+
+# ============================================================
+# STAGE 2 - BUILD AND CONTAINER SECURITY
+# ============================================================
+
+- stage: Build
+  displayName: 'Build and Scan Docker Image'
+
+  dependsOn: Security
+  condition: succeeded()
+
+  jobs:
+
+  - job: BuildDocker
+    displayName: 'Build Docker Image'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    - checkout: self
+
+    # --------------------------------------------------------
+    # Docker Build
+    # --------------------------------------------------------
+
+    - script: |
+        echo "Building Docker image..."
+
+        docker build \
+          -t $(acrLoginServer)/$(imageName):$(imageTag) \
+          -t $(acrLoginServer)/$(imageName):latest \
+          .
+
+        echo "Docker image built successfully."
+
+        docker images
+      displayName: 'Build Docker Image'
+
+
+    # --------------------------------------------------------
+    # TRIVY CONTAINER SCAN
+    # --------------------------------------------------------
+
+    - script: |
+        echo "Running Trivy container vulnerability scan..."
+
+        docker run --rm \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy:latest \
+          image \
+          --severity HIGH,CRITICAL \
+          --exit-code 0 \
+          --no-progress \
+          $(acrLoginServer)/$(imageName):$(imageTag)
+
+        echo "Trivy scan completed."
+      displayName: 'Container Vulnerability Scan'
+
+
+    # --------------------------------------------------------
+    # SAVE IMAGE FOR NEXT STAGE
+    # --------------------------------------------------------
+
+    - script: |
+        echo "Saving Docker image..."
+
+        docker save \
+          $(acrLoginServer)/$(imageName):$(imageTag) \
+          $(acrLoginServer)/$(imageName):latest \
+          -o $(Build.ArtifactStagingDirectory)/financial-image.tar
+
+        ls -lh $(Build.ArtifactStagingDirectory)/financial-image.tar
+      displayName: 'Save Docker Image'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Docker Image Artifact'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/financial-image.tar'
+        artifactName: 'Docker-Image'
+
+
+# ============================================================
+# STAGE 3 - PUSH TO ACR
+# ============================================================
+
+- stage: Push
+  displayName: 'Push Image to Azure Container Registry'
+
+  dependsOn: Build
+  condition: succeeded()
+
+  jobs:
+
+  - job: PushACR
+    displayName: 'Push Scanned Image to ACR'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    - checkout: self
+
+    # --------------------------------------------------------
+    # DOWNLOAD IMAGE ARTIFACT
+    # --------------------------------------------------------
+
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download Docker Image'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'Docker-Image'
+        downloadPath: '$(Pipeline.Workspace)'
+
+    # --------------------------------------------------------
+    # LOAD IMAGE
+    # --------------------------------------------------------
+
+    - script: |
+        echo "Loading Docker image..."
+
+        docker load \
+          -i $(Pipeline.Workspace)/Docker-Image/financial-image.tar
+
+        echo "Loaded images:"
+        docker images
+      displayName: 'Load Docker Image'
+
+
+    # --------------------------------------------------------
+    # LOGIN AND PUSH TO ACR
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Login and Push Image to ACR'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          echo "Logging into Azure Container Registry..."
+
+          az acr login \
+            --name $(acrName)
+
+          echo "Pushing versioned image..."
+
+          docker push \
+            $(acrLoginServer)/$(imageName):$(imageTag)
+
+          echo "Pushing latest image..."
+
+          docker push \
+            $(acrLoginServer)/$(imageName):latest
+
+          echo "Images successfully pushed to ACR."
+
+          echo "Repository:"
+          echo "$(acrLoginServer)/$(imageName)"
+
+          echo "Tag:"
+          echo "$(imageTag)"
+
+
+# ============================================================
+# STAGE 4 - DEPLOY TO AKS
+# ============================================================
+
+- stage: Deploy
+  displayName: 'Deploy to AKS'
+
+  dependsOn: Push
+  condition: succeeded()
+
+  jobs:
+
+  - job: DeployToAKS
+    displayName: 'Deploy Financial Research Assistant'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    # --------------------------------------------------------
+    # GET AKS CREDENTIALS
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Get AKS Credentials'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          echo "Getting AKS credentials..."
+
+          az aks get-credentials \
+            --resource-group $(resourceGroup) \
+            --name $(aksCluster) \
+            --overwrite-existing
+
+          echo "AKS nodes:"
+
+          kubectl get nodes
+
+          echo "Kubernetes version:"
+
+          kubectl version --short 2>/dev/null || kubectl version
+
+
+    # --------------------------------------------------------
+    # VERIFY NAMESPACE
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Verify Kubernetes Namespace'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          kubectl get namespace $(namespace)
+
+          echo "Namespace $(namespace) exists."
+
+
+    # --------------------------------------------------------
+    # DEPLOY SERVICE ACCOUNT
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Deploy ServiceAccount'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          kubectl apply \
+            -f $(Build.SourcesDirectory)/k8s/serviceaccount.yaml \
+            -n $(namespace)
+
+          kubectl get serviceaccount financial-sa \
+            -n $(namespace)
+
+
+    # --------------------------------------------------------
+    # DEPLOY KEY VAULT CSI
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Deploy Key Vault Integration'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          kubectl apply \
+            -f $(Build.SourcesDirectory)/k8s/secretproviderclass.yaml \
+            -n $(namespace)
+
+          kubectl get secretproviderclass financial-keyvault \
+            -n $(namespace)
+
+
+    # --------------------------------------------------------
+    # DEPLOY APPLICATION
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Deploy Application to AKS'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          echo "Applying deployment..."
+
+          kubectl apply \
+            -f $(Build.SourcesDirectory)/k8s/deployment.yml \
+            -n $(namespace)
+
+          echo "Applying service..."
+
+          kubectl apply \
+            -f $(Build.SourcesDirectory)/k8s/service.yml \
+            -n $(namespace)
+
+          echo "Waiting for deployment rollout..."
+
+          kubectl rollout status \
+            deployment/finan-deploy \
+            -n $(namespace) \
+            --timeout=180s
+
+
+    # --------------------------------------------------------
+    # VERIFY DEPLOYMENT
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Verify AKS Deployment'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          echo "================================"
+          echo "Pods"
+          echo "================================"
+
+          kubectl get pods \
+            -n $(namespace) \
+            -o wide
+
+          echo "================================"
+          echo "Services"
+          echo "================================"
+
+          kubectl get svc \
+            -n $(namespace)
+
+          echo "================================"
+          echo "Deployment"
+          echo "================================"
+
+          kubectl get deployment finan-deploy \
+            -n $(namespace)
+
+          echo "================================"
+          echo "ServiceAccount"
+          echo "================================"
+
+          kubectl get serviceaccount financial-sa \
+            -n $(namespace)
+
+
+    # --------------------------------------------------------
+    # VERIFY KEY VAULT SECRET
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Verify Key Vault Secret Integration'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          echo "Checking SecretProviderClass..."
+
+          kubectl get secretproviderclass financial-keyvault \
+            -n $(namespace)
+
+          echo "Checking synchronized Kubernetes secret..."
+
+          kubectl get secret financial-secret \
+            -n $(namespace)
+
+          echo "Secret exists successfully."
+
+
+    # --------------------------------------------------------
+    # HEALTH CHECK
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Application Health Check'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          echo "Waiting for LoadBalancer external IP..."
+
+          EXTERNAL_IP=""
+
+          for i in {1..30}; do
+
+            EXTERNAL_IP=$(kubectl get svc finan-svc \
+              -n $(namespace) \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+
+            if [ -n "$EXTERNAL_IP" ]; then
+              break
+            fi
+
+            echo "External IP not ready. Waiting..."
+
+            sleep 10
+
+          done
+
+          echo "External IP: $EXTERNAL_IP"
+
+          if [ -z "$EXTERNAL_IP" ]; then
+
+            echo "ERROR: LoadBalancer IP was not assigned."
+
+            kubectl describe svc finan-svc \
+              -n $(namespace)
+
+            exit 1
+
+          fi
+
+          echo "Testing application health endpoint..."
+
+          HTTP_STATUS=$(curl \
+            -s \
+            -o /dev/null \
+            -w "%{http_code}" \
+            --max-time 20 \
+            "http://$EXTERNAL_IP/")
+
+          echo "HTTP Status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+
+            echo "ERROR: Application health check failed."
+
+            exit 1
+
+          fi
+
+          echo "================================"
+          echo "Application is HEALTHY"
+          echo "================================"
+
+          echo "Application URL:"
+          echo "http://$EXTERNAL_IP/"
+
+          echo "Swagger URL:"
+          echo "http://$EXTERNAL_IP/docs"
+
+
+# ============================================================
+# STAGE 5 - POST DEPLOYMENT SECURITY VALIDATION
+# ============================================================
+
+- stage: PostDeploymentSecurity
+  displayName: 'Post Deployment Security Validation'
+
+  dependsOn: Deploy
+  condition: succeeded()
+
+  jobs:
+
+  - job: SecurityValidation
+    displayName: 'Validate Kubernetes Security'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    - task: AzureCLI@2
+      displayName: 'Validate AKS Security Configuration'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+
+        inlineScript: |
+
+          set -e
+
+          echo "Getting AKS credentials..."
+
+          az aks get-credentials \
+            --resource-group $(resourceGroup) \
+            --name $(aksCluster) \
+            --overwrite-existing
+
+
+          echo "================================"
+          echo "Checking Pods"
+          echo "================================"
+
+          kubectl get pods \
+            -n $(namespace)
+
+
+          echo "================================"
+          echo "Checking ServiceAccount"
+          echo "================================"
+
+          kubectl get serviceaccount financial-sa \
+            -n $(namespace)
+
+
+          echo "================================"
+          echo "Checking SecretProviderClass"
+          echo "================================"
+
+          kubectl get secretproviderclass financial-keyvault \
+            -n $(namespace)
+
+
+          echo "================================"
+          echo "Checking Kubernetes Secret"
+          echo "================================"
+
+          kubectl get secret financial-secret \
+            -n $(namespace)
+
+
+          echo "================================"
+          echo "Checking Deployment"
+          echo "================================"
+
+          kubectl get deployment finan-deploy \
+            -n $(namespace)
+
+
+          echo "================================"
+          echo "Checking Service"
+          echo "================================"
+
+          kubectl get service finan-svc \
+            -n $(namespace)
+
+
+          echo "================================"
+          echo "Security Validation Completed"
+          echo "================================"
